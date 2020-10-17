@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2014-2016 IBM Corporation.
+ * Copyright (c) 2016-2018 MCCI Corporation.
  * All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -24,6 +25,8 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+#define LMIC_DR_LEGACY 0
 
 #include "lmic.h"
 
@@ -132,8 +135,8 @@
 // #define RegAgcThresh2                              0x45 // common
 // #define RegAgcThresh3                              0x46 // common
 // #define RegPllHop                                  0x4B // common
+#define RegPaDac                                   0x4D // common
 // #define RegTcxo                                    0x58 // common
-#define RegPaDac                                   0x5A // common
 // #define RegPll                                     0x5C // common
 // #define RegPllLowPn                                0x5E // common
 // #define RegFormerTemp                              0x6C // common
@@ -193,7 +196,17 @@
 #define RXLORA_RXMODE_RSSI_REG_MODEM_CONFIG2 0x74
 #endif
 
+//-----------------------------------------
+// Parameters for RSSI monitoring
+#define SX127X_FREQ_LF_MAX      525000000       // per datasheet 6.3
+ 
+// per datasheet 5.5.3:
+#define SX127X_RSSI_ADJUST_LF   -164            // add to rssi value to get dB (LF)
+#define SX127X_RSSI_ADJUST_HF   -157            // add to rssi value to get dB (HF)
 
+// per datasheet 2.5.2 (but note that we ought to ask Semtech to confirm, because
+// datasheet is unclear).
+#define SX127X_RX_POWER_UP      us2osticks(500) // delay this long to let the receiver power up.
 
 // ----------------------------------------
 // Constants for radio registers
@@ -421,15 +434,19 @@ static void configChannel () {
 
 static void configPower () {
 #ifdef CFG_sx1276_radio
-    // no boost used for now
+    // PA_BOOST output is assumed but not 20 dBm.
     s1_t pw = (s1_t)LMIC.txpow;
-    if(pw >= 17) {
-        pw = 15;
+    if(pw > 17) {
+        pw = 17;
     } else if(pw < 2) {
         pw = 2;
     }
-    // check board type for BOOST pin
-    writeReg(RegPaConfig, (u1_t)(0x80|(pw&0xf)));
+    // 0x80 forces use of PA_BOOST; but we don't 
+    //    turn on 20 dBm mode. So powers are:
+    //    0000 => 2dBm, 0001 => 3dBm, ... 1111 => 17dBm
+    // But we also enforce that the high-power mode
+    //    is off by writing RegPaDac.
+    writeReg(RegPaConfig, (u1_t)(0x80|(pw - 2)));
     writeReg(RegPaDac, readReg(RegPaDac)|0x4);
 
 #elif CFG_sx1272_radio
@@ -543,7 +560,33 @@ static void txlora () {
 
 // start transmitter (buf=LMIC.frame, len=LMIC.dataLen)
 static void starttx () {
-    ASSERT( (readReg(RegOpMode) & OPMODE_MASK) == OPMODE_SLEEP );
+    u1_t const rOpMode = readReg(RegOpMode);
+
+    // originally, this code ASSERT()ed, but asserts are both bad and
+    // blunt instruments. If we see that we're not in sleep mode,
+    // force sleep (because we might have to switch modes)
+    if ((rOpMode & OPMODE_MASK) != OPMODE_SLEEP) {
+#if LMIC_DEBUG_LEVEL > 0
+        LMIC_DEBUG_PRINTF("?%s: OPMODE != OPMODE_SLEEP: %#02x\n", __func__, rOpMode);
+#endif
+        opmode(OPMODE_SLEEP);
+        hal_waitUntil(os_getTime() + ms2osticks(1));
+    }
+
+    if (LMIC.lbt_ticks > 0) {
+        oslmic_radio_rssi_t rssi;
+        radio_monitor_rssi(LMIC.lbt_ticks, &rssi);
+#if LMIC_X_DEBUG_LEVEL > 0
+	LMIC_X_DEBUG_PRINTF("LBT rssi max:min=%d:%d %d times in %d\n", rssi.max_rssi, rssi.min_rssi, rssi.n_rssi, LMIC.lbt_ticks);
+#endif
+
+        if (rssi.max_rssi >= LMIC.lbt_dbmax) {
+            // complete the request by scheduling the job
+            os_setCallback(&LMIC.osjob, LMIC.osjob.func);
+            return;
+        }
+    }
+
     if(getSf(LMIC.rps) == FSK) { // FSK modem
         txfsk();
     } else { // LoRa modem
@@ -701,7 +744,7 @@ static void startrx (u1_t rxmode) {
 }
 
 // get random seed from wideband noise rssi
-void radio_init () {
+int radio_init () {
     hal_disableIRQs();
 
     // manually reset radio
@@ -719,9 +762,11 @@ void radio_init () {
     // some sanity checks, e.g., read version number
     u1_t v = readReg(RegVersion);
 #ifdef CFG_sx1276_radio
-    ASSERT(v == 0x12 );
+    if(v != 0x12 )
+        return 0;
 #elif CFG_sx1272_radio
-    ASSERT(v == 0x22);
+    if(v != 0x22)
+        return 0;
 #else
 #error Missing CFG_sx1272_radio/CFG_sx1276_radio
 #endif
@@ -759,6 +804,7 @@ void radio_init () {
     opmode(OPMODE_SLEEP);
 
     hal_enableIRQs();
+    return 1;
 }
 
 // return next random byte derived from seed buffer
@@ -780,6 +826,82 @@ u1_t radio_rssi () {
     u1_t r = readReg(LORARegRssiValue);
     hal_enableIRQs();
     return r;
+}
+
+// monitor rssi for specified number of ostime_t ticks, and return statistics
+// This puts the radio into RX continuous mode, waits long enough for the
+// oscillators to start and the PLL to lock, and then measures for the specified
+// period of time.  The radio is then returned to idle.
+//
+// RSSI returned is expressed in units of dB, and is offset according to the
+// current radio setting per section 5.5.5 of Semtech 1276 datasheet.
+void radio_monitor_rssi(ostime_t nTicks, oslmic_radio_rssi_t *pRssi) {
+    uint8_t rssiMax, rssiMin;
+    uint16_t rssiSum;
+    uint16_t rssiN;
+
+    int rssiAdjust;
+    ostime_t tBegin;
+    int notDone;
+
+    rxlora(RXMODE_SCAN);
+
+    // while we're waiting for the PLLs to spin up, determine which
+    // band we're in and choose the base RSSI.
+    if (LMIC.freq > SX127X_FREQ_LF_MAX) {
+            rssiAdjust = SX127X_RSSI_ADJUST_HF;
+    } else {
+            rssiAdjust = SX127X_RSSI_ADJUST_LF;
+    }
+    rssiAdjust += hal_getRssiCal();
+
+    // zero the results
+    rssiMax = 255;
+    rssiMin = 0;
+    rssiSum = 0;
+    rssiN = 0;
+
+    // wait for PLLs
+    hal_waitUntil(os_getTime() + SX127X_RX_POWER_UP);
+
+    // scan for the desired time.
+    tBegin = os_getTime();
+    rssiMax = 0;
+
+    /* XXX(tanupoo)
+     * In this loop, micros() in os_getTime() returns a past time sometimes.
+     * At least, it happens on Dragino LoRa Mini.
+     * the return value of micros() looks not to be stable in IRQ disabled.
+     * Once it happens, this loop never exit infinitely.
+     * In order to prevent it, it enables IRQ before calling os_getTime(),
+     * disable IRQ again after that.
+     */
+    do {
+        ostime_t now;
+
+        u1_t rssiNow = readReg(LORARegRssiValue);
+
+        if (rssiMax < rssiNow)
+                rssiMax = rssiNow;
+        if (rssiNow < rssiMin)
+                rssiMin = rssiNow;
+        rssiSum += rssiNow;
+        ++rssiN;
+	// TODO(tmm@mcci.com) move this to os_getTime().
+        hal_enableIRQs();
+        now = os_getTime();
+        hal_disableIRQs();
+        notDone = now - (tBegin + nTicks) < 0;
+    } while (notDone);
+
+    // put radio back to sleep
+    opmode(OPMODE_SLEEP);
+
+    // compute the results
+    pRssi->max_rssi = (s2_t) (rssiMax + rssiAdjust);
+    pRssi->min_rssi = (s2_t) (rssiMin + rssiAdjust);
+    pRssi->mean_rssi = (s2_t) (rssiAdjust + ((rssiSum + (rssiN >> 1)) / rssiN));
+    pRssi->n_rssi = rssiN;
 }
 
 static CONST_TABLE(u2_t, LORA_RXDONE_FIXUP)[] = {
@@ -811,6 +933,7 @@ void radio_irq_handler (u1_t dio) {
 #endif
     if( (readReg(RegOpMode) & OPMODE_LORA) != 0) { // LORA modem
         u1_t flags = readReg(LORARegIrqFlags);
+        LMIC_X_DEBUG_PRINTF("IRQ=%02x\n", flags);
         if( flags & IRQ_LORA_TXDONE_MASK ) {
             // save exact tx time
             LMIC.txend = now - us2osticks(43); // TXDONE FIXUP
@@ -829,7 +952,9 @@ void radio_irq_handler (u1_t dio) {
             readBuf(RegFifo, LMIC.frame, LMIC.dataLen);
             // read rx quality parameters
             LMIC.snr  = readReg(LORARegPktSnrValue); // SNR [dB] * 4
-            LMIC.rssi = readReg(LORARegPktRssiValue) - 125 + 64; // RSSI [dBm] (-196...+63)
+            LMIC.rssi = readReg(LORARegPktRssiValue);
+            LMIC_X_DEBUG_PRINTF("RX snr=%u rssi=%d\n", LMIC.snr/4, SX127X_RSSI_ADJUST_HF + LMIC.rssi);
+            LMIC.rssi = LMIC.rssi - 125 + 64; // RSSI [dBm] (-196...+63)
         } else if( flags & IRQ_LORA_RXTOUT_MASK ) {
             // indicate timeout
             LMIC.dataLen = 0;

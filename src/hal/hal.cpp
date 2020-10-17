@@ -17,59 +17,71 @@
 // -----------------------------------------------------------------------------
 // I/O
 
+static const lmic_pinmap *plmic_pins;
+
 static void hal_interrupt_init(); // Fwd declaration
 
 static void hal_io_init () {
     // NSS and DIO0 are required, DIO1 is required for LoRa, DIO2 for FSK
-    ASSERT(lmic_pins.nss != LMIC_UNUSED_PIN);
-    ASSERT(lmic_pins.dio[0] != LMIC_UNUSED_PIN);
-    ASSERT(lmic_pins.dio[1] != LMIC_UNUSED_PIN || lmic_pins.dio[2] != LMIC_UNUSED_PIN);
+    ASSERT(plmic_pins->nss != LMIC_UNUSED_PIN);
+    ASSERT(plmic_pins->dio[0] != LMIC_UNUSED_PIN);
+    ASSERT(plmic_pins->dio[1] != LMIC_UNUSED_PIN || plmic_pins->dio[2] != LMIC_UNUSED_PIN);
 
-    pinMode(lmic_pins.nss, OUTPUT);
-    if (lmic_pins.rxtx != LMIC_UNUSED_PIN)
-        pinMode(lmic_pins.rxtx, OUTPUT);
-    if (lmic_pins.rst != LMIC_UNUSED_PIN)
-        pinMode(lmic_pins.rst, OUTPUT);
+//    Serial.print("nss: "); Serial.println(plmic_pins->nss);
+//    Serial.print("rst: "); Serial.println(plmic_pins->rst);
+//    Serial.print("dio[0]: "); Serial.println(plmic_pins->dio[0]);
+//    Serial.print("dio[1]: "); Serial.println(plmic_pins->dio[1]);
+//    Serial.print("dio[2]: "); Serial.println(plmic_pins->dio[2]);
+
+    pinMode(plmic_pins->nss, OUTPUT);
+    if (plmic_pins->rxtx != LMIC_UNUSED_PIN)
+        pinMode(plmic_pins->rxtx, OUTPUT);
+    if (plmic_pins->rst != LMIC_UNUSED_PIN)
+        pinMode(plmic_pins->rst, OUTPUT);
 
     hal_interrupt_init();
 }
 
-// val == 1  => tx 1
+// val == 1  => tx
 void hal_pin_rxtx (u1_t val) {
-    if (lmic_pins.rxtx != LMIC_UNUSED_PIN)
-        digitalWrite(lmic_pins.rxtx, val);
+    if (plmic_pins->rxtx != LMIC_UNUSED_PIN)
+        digitalWrite(plmic_pins->rxtx, val != plmic_pins->rxtx_rx_active);
 }
 
 // set radio RST pin to given value (or keep floating!)
 void hal_pin_rst (u1_t val) {
-    if (lmic_pins.rst == LMIC_UNUSED_PIN)
+    if (plmic_pins->rst == LMIC_UNUSED_PIN)
         return;
 
     if(val == 0 || val == 1) { // drive pin
-        pinMode(lmic_pins.rst, OUTPUT);
-        digitalWrite(lmic_pins.rst, val);
+        pinMode(plmic_pins->rst, OUTPUT);
+        digitalWrite(plmic_pins->rst, val);
     } else { // keep pin floating
-        pinMode(lmic_pins.rst, INPUT);
+        pinMode(plmic_pins->rst, INPUT);
     }
+}
+
+s1_t hal_getRssiCal (void) {
+    return plmic_pins->rssi_cal;
 }
 
 #if !defined(LMIC_USE_INTERRUPTS)
 static void hal_interrupt_init() {
-    pinMode(lmic_pins.dio[0], INPUT);
-    if (lmic_pins.dio[1] != LMIC_UNUSED_PIN)
-        pinMode(lmic_pins.dio[1], INPUT);
-    if (lmic_pins.dio[2] != LMIC_UNUSED_PIN)
-        pinMode(lmic_pins.dio[2], INPUT);
+    pinMode(plmic_pins->dio[0], INPUT);
+    if (plmic_pins->dio[1] != LMIC_UNUSED_PIN)
+        pinMode(plmic_pins->dio[1], INPUT);
+    if (plmic_pins->dio[2] != LMIC_UNUSED_PIN)
+        pinMode(plmic_pins->dio[2], INPUT);
 }
 
 static bool dio_states[NUM_DIO] = {0};
 static void hal_io_check() {
     uint8_t i;
     for (i = 0; i < NUM_DIO; ++i) {
-        if (lmic_pins.dio[i] == LMIC_UNUSED_PIN)
+        if (plmic_pins->dio[i] == LMIC_UNUSED_PIN)
             continue;
 
-        if (dio_states[i] != digitalRead(lmic_pins.dio[i])) {
+        if (dio_states[i] != digitalRead(plmic_pins->dio[i])) {
             dio_states[i] = !dio_states[i];
             if (dio_states[i])
                 radio_irq_handler(i);
@@ -96,17 +108,17 @@ static isr_t interrupt_fns[NUM_DIO] = {hal_isrPin0, hal_isrPin1, hal_isrPin2};
 
 static void hal_interrupt_init() {
   for (uint8_t i = 0; i < NUM_DIO; ++i) {
-      if (lmic_pins.dio[i] == LMIC_UNUSED_PIN)
+      if (plmic_pins->dio[i] == LMIC_UNUSED_PIN)
           continue;
 
-      attachInterrupt(digitalPinToInterrupt(lmic_pins.dio[i]), interrupt_fns[i], RISING);
+      attachInterrupt(digitalPinToInterrupt(plmic_pins->dio[i]), interrupt_fns[i], RISING);
   }
 }
 
 static void hal_io_check() {
     uint8_t i;
     for (i = 0; i < NUM_DIO; ++i) {
-        if (lmic_pins.dio[i] == LMIC_UNUSED_PIN)
+        if (plmic_pins->dio[i] == LMIC_UNUSED_PIN)
             continue;
 
         if (interrupt_flags[i]) {
@@ -120,20 +132,25 @@ static void hal_io_check() {
 // -----------------------------------------------------------------------------
 // SPI
 
-static const SPISettings settings(LMIC_SPI_FREQ, MSBFIRST, SPI_MODE0);
-
 static void hal_spi_init () {
-    SPI.begin();
+    SPI.begin(14, 12, 13, 16);
 }
 
 void hal_pin_nss (u1_t val) {
-    if (!val)
+    if (!val) {
+        uint32_t spi_freq;
+
+        if ((spi_freq = plmic_pins->spi_freq) == 0)
+            spi_freq = LMIC_SPI_FREQ;
+
+        SPISettings settings(spi_freq, MSBFIRST, SPI_MODE0);
         SPI.beginTransaction(settings);
-    else
+    } else {
         SPI.endTransaction();
+    }
 
     //Serial.println(val?">>":"<<");
-    digitalWrite(lmic_pins.nss, val);
+    digitalWrite(plmic_pins->nss, val);
 }
 
 // perform SPI transaction with radio
@@ -273,7 +290,13 @@ void hal_printf_init() {
 }
 #endif // defined(LMIC_PRINTF_TO)
 
-void hal_init () {
+void hal_init (void) {
+    hal_init_ex(&lmic_pins);
+}
+
+void hal_init_ex (const void *pContext) {
+    plmic_pins = (const lmic_pinmap *)pContext;
+
     // configure radio I/O and interrupt handler
     hal_io_init();
     // configure radio SPI

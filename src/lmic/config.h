@@ -3,20 +3,43 @@
 
 // In the original LMIC code, these config values were defined on the
 // gcc commandline. Since Arduino does not allow easily modifying the
-// compiler commandline, use this file to load project defaults and then fall back.
-// Note that you should not edit this file, because then your changes will
-// be applied to a globally-distributed file. Instead, create an 
-// lmic_project_config.h file.
+// compiler commandline unless you modify the BSP, you have two choices:
+//
+//  - edit {libraries}/arduino-lmic/project_config/lmic_project_config.h;
+//  - use a BSP like the MCCI Arduino BSPs, which get the configuration
+//    from the boards.txt file through a menu option.
+//
+// You definitely should not edit this file.
 
-// if you want to override this, put a lora_project_config.h in your sketch directory.
-// otherwise the lmic_project_config.h from this directory will be used.
-#include "../../project_config/lmic_project_config.h"
+// set up preconditions, and load configuration if needed.
+#ifndef _LMIC_CONFIG_PRECONDITIONS_H_
+# include "lmic_config_preconditions.h"
+#endif
 
-#if ! (defined(CFG_eu868) || defined(CFG_us915))
-# warning Target RF configuration not defined, assuming CFG_eu868
-#define CFG_eu868 1
-#elif defined(CFG_eu868) && defined(CFG_us915)
-# error You can define at most one of CFG_eu868 and CFG_us915
+// check post-conditions.
+
+// make sure that we have exactly one target region defined.
+#if CFG_LMIC_REGION_MASK == 0
+# define CFG_eu868 1
+#elif (CFG_LMIC_REGION_MASK & (-CFG_LMIC_REGION_MASK)) != CFG_LMIC_REGION_MASK
+# error You can define at most one of CFG_... variables
+#elif (CFG_LMIC_REGION_MASK & LMIC_REGIONS_SUPPORTED) == 0
+# error The selected CFG_... region is not supported yet.
+#endif
+
+// make sure that LMIC_COUNTRY_CODE is defined.
+#ifndef LMIC_COUNTRY_CODE
+# define LMIC_COUNTRY_CODE      LMIC_COUNTRY_CODE_NONE
+#endif
+
+// if the country code is Japan, then the region must be AS923
+#if LMIC_COUNTRY_CODE == LMIC_COUNTRY_CODE_JP && CFG_region != LMIC_REGION_as923
+# error "If country code is JP, then region must be AS923"
+#endif
+
+// check for internal consistency
+#if !(CFG_LMIC_EU_like || CFG_LMIC_US_like)
+# error "Internal error: Neither EU-like nor US-like!"
 #endif
 
 // This is the SX1272/SX1273 radio, which is also used on the HopeRF
@@ -24,6 +47,9 @@
 //#define CFG_sx1272_radio 1
 // This is the SX1276/SX1277/SX1278/SX1279 radio, which is also used on
 // the HopeRF RFM95 boards.
+//#define CFG_sx1276_radio 1
+
+// ensure that a radio is defined.
 #if ! (defined(CFG_sx1272_radio) || defined(CFG_sx1276_radio))
 # warning Target radio not defined, assuming CFG_sx1276_radio
 #define CFG_sx1276_radio 1
@@ -74,7 +100,7 @@
 // silently halt execution. Otherwise, LMIC_FAILURE_TO should be defined
 // as the name of an object derived from Print, which will be used for
 // displaying runtime assertion failures. If you say nothing in your
-// lmic_project_config.h, runtime assertion failures are displayed 
+// lmic_project_config.h, runtime assertion failures are displayed
 // using the Serial object.
 #if ! defined(DISABLE_LMIC_FAILURE_TO) && ! defined(LMIC_FAILURE_TO)
 #define LMIC_FAILURE_TO Serial
@@ -100,11 +126,11 @@
 // In LoRaWAN, a gateway applies I/Q inversion on TX, and nodes do the
 // same on RX. This ensures that gateways can talk to nodes and vice
 // versa, but gateways will not hear other gateways and nodes will not
-// hear other nodes. By defining this macro in lmic_project_config.h, 
-// this inversion is disabled and this node can hear other nodes. If 
-// two nodes both have this macro set, they can talk to each other 
-// (but they can no longer hear gateways). This should probably only 
-// be used when debugging and/or when talking to the radio directly 
+// hear other nodes. By defining this macro in lmic_project_config.h,
+// this inversion is disabled and this node can hear other nodes. If
+// two nodes both have this macro set, they can talk to each other
+// (but they can no longer hear gateways). This should probably only
+// be used when debugging and/or when talking to the radio directly
 // (e.g. like in the "raw" example).
 //#define DISABLE_INVERT_IQ_ON_RX
 
@@ -130,4 +156,19 @@
 #if defined(USE_ORIGINAL_AES) && defined(USE_IDEETRON_AES)
 # error "You may define at most one of USE_ORIGINAL_AES and USE_IDEETRON_AES"
 #endif
+
+// LMIC_DISABLE_DR_LEGACY
+// turn off legacy DR_* symbols that vary by bandplan.
+// Older code uses these for configuration. EU868_DR_*, US915_DR_*
+// etc symbols are prefered, but breaking older code is inconvenient for
+// everybody. We don't want to use DR_* in the LMIC itself, so we provide
+// this #define to allow them to be removed.
+#if !defined(LMIC_DR_LEGACY)
+# if !defined(LMIC_DISABLE_DR_LEGACY)
+#  define LMIC_DR_LEGACY 1
+# else // defined(LMIC_DISABLE_DR_LEGACY)
+#  define LMIC_DR_LEGACY 0
+# endif // defined(LMIC_DISABLE_DR_LEGACY)
+#endif // LMIC_DR_LEGACY
+
 #endif // _lmic_config_h_

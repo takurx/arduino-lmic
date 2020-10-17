@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2014-2016 IBM Corporation.
+ * Copyright (c) 2016, 2018 MCCI Corporation.
  * All rights reserved.
  *
  *  Redistribution and use in source and binary forms, with or without
@@ -36,6 +37,11 @@ extern "C"{
  * initialize hardware (IO, SPI, TIMER, IRQ).
  */
 void hal_init (void);
+
+/*
+ * initialize hardware, passing in platform-specific context
+ */
+void hal_init_ex (const void *pContext);
 
 /*
  * drive radio NSS pin (0=low, 1=high).
@@ -99,6 +105,11 @@ u1_t hal_checkTimer (u4_t targettime);
  *   - action could be HALT or reboot
  */
 void hal_failed (const char *file, u2_t line);
+
+/*
+ * get the calibration value for radio_rssi
+ */
+s1_t hal_getRssiCal (void);
 
 #ifdef __cplusplus
 } // extern "C"
